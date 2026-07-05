@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Huawei Y6 2018 (ATU-L21), codename "atomu"
+ *
+ * First-pass draft assembled from:
+ *  - huawei_msm8917_atu_l21_va.dts   (board-id, base regulators)
+ *  - huawei_msm8917_base.dtsi        (msm8917 + pmi8937-qrd-sku5 base)
+ *  - atu_l21_va_djn_cpt_ili9881c_5p7_hd_video.dtsi (panel timing/init)
+ *  - huawei-tp.dtsi                  (touchscreen candidates)
+ *  - huawei-keypad.dtsi              (volume-up key)
+ *
+ * All downstream sources are from FrostI7Alex/linux-huawei-aum
+ * (aum and atomu share the same reference board, differentiated by
+ * board-id, confirmed by identical regulator/GPIO assignments).
+ *
+ * !!! THIS IS A DRAFT, NOT A KNOWN-WORKING FILE !!!
+ * Every "CHECK:" comment below marks something that must be verified
+ * against the actual msm8917.dtsi / pm8937.dtsi labels in whichever
+ * mainline tree this is built against (msm89x7-mainline/linux) before
+ * this will even compile, let alone boot. Diff node-for-node against
+ * msm8917-huawei-agassi.dts for the correct label names in that tree.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include "msm8917.dtsi"
+#include "pm8937.dtsi"
+
+/ {
+	model = "Huawei Y6 2018 (ATU-L21)";
+	compatible = "huawei,atu-l21", "qcom,msm8917";
+	chassis-type = "handset";
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/*
+		 * Continuous splash framebuffer, taken directly from your
+		 * own lk2nd log:
+		 *   base: 0x90001000, stride: 2160, src: 720x1440, bpp: 3
+		 */
+		framebuffer0: framebuffer@90001000 {
+			compatible = "simple-framebuffer";
+			reg = <0x0 0x90001000 0x0 (720 * 1440 * 3)>;
+			width = <720>;
+			height = <1440>;
+			stride = <(720 * 3)>;
+			format = "r8g8b8";
+			/* CHECK: add clocks/power-domains here if the
+			 * mainline tree's other msm8917 boards do — copy
+			 * from agassi's framebuffer0 node verbatim. */
+		};
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		label = "gpio-keys";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&gpio_key_volup_default>; /* CHECK: pinctrl node name */
+
+		key-volume-up {
+			label = "volume_up";
+			gpios = <&tlmm 91 GPIO_ACTIVE_LOW>;
+			linux,input-type = <1>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <15>;
+		};
+		/* Volume-down and power are on the PM8937 PON block
+		 * (inherited from pm8937.dtsi), not discrete GPIOs —
+		 * no node needed here. */
+	};
+};
+
+&tlmm {
+	gpio_key_volup_default: gpio-key-volup-default-state {
+		pins = "gpio91";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	/* CHECK: add pinctrl states for panel reset/bias/backlight
+	 * GPIOs (60, 98, 124, 127) and touch reset/irq (64, 65) here,
+	 * following whatever convention agassi's &tlmm block uses. */
+};
+
+/*
+ * --- Display ---
+ * Panel: DJN/CPT ili9881c, 720x1440, 5.7", video mode, 3 data lanes,
+ * 60Hz, DSI clock 667MHz. Bias IC: Silergy SM5109 (matches
+ * `lcdbias_ic=hw_sm5109` from your lk2nd cmdline capture).
+ *
+ * IMPORTANT CAVEAT: mainline Linux already has a generic
+ * drivers/gpu/drm/panel/panel-ilitek-ili9881c.c driver, but it only
+ * knows the specific init-sequence tables that have been added to it
+ * upstream. Your panel's DCS init blob (from
+ * atu_l21_va_djn_cpt_ili9881c_5p7_hd_video.dtsi) is very likely NOT
+ * one of the existing tables — you will probably need to add a new
+ * entry to that driver's C source with your panel's init sequence,
+ * and give it a new compatible string, rather than expect a plain
+ * devicetree node to carry the whole init blob on its own. This dts
+ * node assumes such a driver entry exists; treat "huawei,atu-l21-
+ * djn-cpt-ili9881c" as a compatible you still need to add kernel-side.
+ */
+&mdss_dsi0 {
+	status = "okay";
+
+	panel: panel@0 {
+		compatible = "huawei,atu-l21-djn-cpt-ili9881c"; /* TODO: add matching driver entry */
+		reg = <0>;
+
+		reset-gpios = <&tlmm 60 GPIO_ACTIVE_LOW>;
+
+		vsp-supply-gpios = <&tlmm 124 GPIO_ACTIVE_HIGH>; /* CHECK: naming convention */
+		vsn-supply-gpios = <&tlmm 127 GPIO_ACTIVE_HIGH>;
+
+		backlight = <&panel>; /* backlight is DCS-controlled, no separate node */
+
+		width-mm = <67>;
+		height-mm = <135>;
+
+		port {
+			panel_in: endpoint {
+				remote-endpoint = <&dsi0_out>;
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in>;
+	data-lanes = <0 1 2>; /* 3 lanes only, per lcdkit-lane-{0,1,2}-state */
+};
+
+/*
+ * --- Touchscreen ---
+ * Two candidate chips seen in downstream sources — Huawei
+ * dual-sourced this part. UNCOMMENT WHICHEVER MATCHES YOUR UNIT
+ * after running `i2cdetect -y 3` from a working shell (0x38 =
+ * FocalTech, 0x5d = Goodix). Do not guess — flashing the wrong one
+ * just gives you a silent non-working touchscreen.
+ */
+&i2c_3 { /* CHECK: actual i2c controller label in mainline tree */
+	status = "okay";
+
+	/* Candidate A: FocalTech
+	touchscreen@38 {
+		compatible = "focaltech,fts";
+		reg = <0x38>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <65 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&tlmm 64 GPIO_ACTIVE_LOW>;
+		touchscreen-size-x = <720>;
+		touchscreen-size-y = <1440>;
+	};
+	*/
+
+	/* Candidate B: Goodix GT917D
+	touchscreen@5d {
+		compatible = "goodix,gt917d", "goodix,gt9271";
+		reg = <0x5d>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <65 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&tlmm 64 GPIO_ACTIVE_LOW>;
+		touchscreen-size-x = <720>;
+		touchscreen-size-y = <1440>;
+	};
+	*/
+};
+
+/*
+ * --- Regulators ---
+ * CHECK: this whole block is a placeholder. huawei_msm8917_atu_l21_va.dts
+ * marks l6 and l10 as always-on at the downstream level — find the
+ * equivalent PM8937 regulator labels already defined in pm8937.dtsi
+ * in this mainline tree and add regulator-always-on there, or in a
+ * &rpm_requests override here, matching agassi's pattern exactly.
+ */
